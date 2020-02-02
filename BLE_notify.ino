@@ -1,33 +1,16 @@
-/*
-    Video: https://www.youtube.com/watch?v=oCMOYS71NIU
-    Based on Neil Kolban example for IDF:
-   https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleNotify.cpp
-    Ported to Arduino ESP32 by Evandro Copercini
-    updated by chegewara
-
-   Create a BLE server that, once we receive a connection, will send periodic
-   notifications. The service advertises itself as:
-   4fafc201-1fb5-459e-8fcc-c5c9c331914b And has a characteristic of:
-   beb5483e-36e1-4688-b7f5-ea07361b26a8
-
-   The design of creating the BLE server is:
-   1. Create a BLE Server
-   2. Create a BLE Service
-   3. Create a BLE Characteristic on the Service
-   4. Create a BLE Descriptor on the characteristic
-   5. Start the service.
-   6. Start advertising.
-
-   A connect hander associated with the server starts a background task that
-   performs notification every couple of seconds.
-*/
+/**
+ * Ground Gear
+ * Mbox BLE implementation
+ */
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 
+#define GG_DEVICE_NAME "GroundGear"
 #define LED_PIN 2
-#define MAX_ADVERTISE_COUNT 1000
+
+#define SERIAL_SPEED 115200
 
 // Ground Gear BLE status
 enum GGState {
@@ -37,74 +20,116 @@ enum GGState {
   GG_STATE_CONNECTED
 };
 
-BLEServer *pServer = NULL;
-BLECharacteristic *pCharacteristic = NULL;
-bool deviceConnected = false;
+BLEServer *pServer = nullptr;
+BLEService *pService = nullptr;
+BLECharacteristic *pCharacteristicTx = nullptr; // 送信用
+BLECharacteristic *pCharacteristicRx = nullptr; // 受信用
 GGState ggState = GG_STATE_DISCONNECTED;
 uint32_t countAdvertizing = 0;
-uint32_t value = 0;
+uint32_t countLoop = 0;
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
 
-#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define UUID_SERVICE "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define UUID_CHARACTERISTIC_TX "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define UUID_CHARACTERISTIC_RX "eaaf5154-4693-4d68-b887-0ef9dfde70aa"
 
-class GroundGearCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) {
-    deviceConnected = true;
-    ggState = GG_STATE_CONNECTING;
-  };
-  void onDisconnect(BLEServer *pServer) {
-    deviceConnected = false;
-    ggState = GG_STATE_DISCONNECTED;
+/**
+ * BLEサーバ 接続コールバッククラス
+ */
+class GGServerCallbacks : public BLEServerCallbacks {
+public:
+  void onConnect(BLEServer *pServer) { ggState = GG_STATE_CONNECTING; }
+  void onDisconnect(BLEServer *pServer) { ggState = GG_STATE_DISCONNECTED; }
+};
+
+/**
+ * BLE特性 受信コールバッククラス
+ */
+class GGCharacteristicRxCallbacks : public BLECharacteristicCallbacks {
+public:
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    auto value = pCharacteristic->getValue();
+    Serial.print("get value = ");
+    Serial.println(value.c_str());
+    switch (value[0]) {
+    case '0':
+      digitalWrite(LED_PIN, LOW);
+      break;
+    case '1':
+      digitalWrite(LED_PIN, HIGH);
+      break;
+    }
   }
 };
 
-void setup() {
-  Serial.begin(115200);
+// BLEサービスの作成
+void initService() { pService = pServer->createService(UUID_SERVICE); }
 
-  // Create the BLE Device
-  BLEDevice::init("GroundGear");
+// BLE特性(キャラクタリスティック)の作成
+void initCharacteristics() {
+  // 送信用BLE特性の作成と初期化
+  pCharacteristicTx = pService->createCharacteristic(
+      UUID_CHARACTERISTIC_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pCharacteristicTx->addDescriptor(new BLE2902());
 
-  // Create the BLE Server
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new GroundGearCallbacks());
+  // 受信用BLE特性の作成と初期化
+  pCharacteristicRx = pService->createCharacteristic(
+      UUID_CHARACTERISTIC_RX, BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristicRx->setCallbacks(new GGCharacteristicRxCallbacks());
+}
 
-  // Create the BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  // Create a BLE Characteristic
-  pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ |
-                               BLECharacteristic::PROPERTY_WRITE |
-                               BLECharacteristic::PROPERTY_NOTIFY |
-                               BLECharacteristic::PROPERTY_INDICATE);
-
-  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
-  // Create a BLE Descriptor
-  pCharacteristic->addDescriptor(new BLE2902());
-
-  // Start the service
-  pService->start();
-
-  // Start advertising
+// アドバタイズ初期化
+void initAdvertising() {
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
+
+  pAdvertising->addServiceUUID(BLEUUID(UUID_SERVICE));
   pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(
-      0x0); // set value to 0x00 to not advertise this parameter
+
+  // set value to 0x00 to not advertise this parameter
+  pAdvertising->setMinPreferred(0x0);
+}
+
+// アドバタイズ開始
+void startAdvertising() {
   BLEDevice::startAdvertising();
   delay(500);
+}
 
-  Serial.println("Setup finished.");
+/**
+ * setupエントリ
+ */
+void setup() {
+  Serial.begin(SERIAL_SPEED);
+
+  // BLEデバイスの初期化
+  BLEDevice::init(GG_DEVICE_NAME);
+
+  // BLEサーバの作成
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new GGServerCallbacks());
+
+  initService();
+  initCharacteristics();
+
+  // サービス開始
+  pService->start();
+
+  // アドバタイズの初期化と開始
+  initAdvertising();
+  startAdvertising();
+
   pinMode(LED_PIN, OUTPUT);
 }
 
+/**
+ * loopエントリ
+ */
 void loop() {
   switch (ggState) {
   case GG_STATE_DISCONNECTED:
-    Serial.println("disconnectd");
+    Serial.println("disconnected");
     digitalWrite(LED_PIN, LOW);
 
     delay(1000); // give the bluetooth stack the chance to get things ready
@@ -124,26 +149,27 @@ void loop() {
     Serial.println(countAdvertizing);
 
     countAdvertizing += 1;
-    if (countAdvertizing > MAX_ADVERTISE_COUNT) {
-      pServer->startAdvertising(); // restart advertising
-    }
-    delay(1000);
     break;
 
   case GG_STATE_CONNECTING:
     digitalWrite(LED_PIN, HIGH);
+    countLoop = 0;
     ggState = GG_STATE_CONNECTED;
     break;
 
   case GG_STATE_CONNECTED:
-    pCharacteristic->setValue((uint8_t *)&value, 4);
-    pCharacteristic->notify();
+    pCharacteristicTx->setValue((uint8_t *)&countLoop, 4);
+    pCharacteristicTx->notify();
+    // pCharacteristicTx->indicate();
+    delay(1000);
+    /*
     delay(3); // bluetooth stack will go into congestion, if too many packets
               // are sent, in 6 hours test i was able to go as low as 3ms
+    */
 
-    value += 1;
-    Serial.print("value=");
-    Serial.println(value);
+    countLoop += 1;
+    Serial.print("countLoop=");
+    Serial.println(countLoop);
 
     break;
   }
